@@ -1,5 +1,5 @@
 # lynn
-An implementation of a 'linear' type theory with uniqueness types.
+An implementation of QTT (with some extras).
 
 ## Resources (for me lol, I have no idea about this):
 - https://personal.cis.strath.ac.uk/conor.mcbride/PlentyO-CR.pdf
