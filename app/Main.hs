@@ -14,8 +14,8 @@ main = do
     l <- getLine
     case parseTL "" l of
         Right e ->
-            case typecheck (Term,Env M.empty) 0 e of
-                Right t -> print t
+            case typecheck e ((Positive,Positive),Usage Omega Omega,Env M.empty) 0 of
+                Right (t,_,_) -> print t
                 Left e -> putStr "typeerror: " >> print e
         Left e -> putStr "parseerror: " >> print e
     main

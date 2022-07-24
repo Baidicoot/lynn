@@ -1,5 +1,5 @@
 # lynn
-An implementation of QTT (with some extras).
+An implementation of a dependent type theory with uniqueness types and types for runtime erasure.
 
 ## Resources (for me lol, I have no idea about this):
 - https://personal.cis.strath.ac.uk/conor.mcbride/PlentyO-CR.pdf

@@ -36,7 +36,7 @@ bijou = haskellDef
         ++ ["ccall","prim"]
         ++ ["data","gadt","struct"]
     , Token.reservedOpNames = Token.reservedOpNames haskellDef
-        ++ [".",",","(->)","->"]
+        ++ [".",",","(->)","->","%","!","^"]
     }
 
 reservedOpNames :: [String]
@@ -124,7 +124,7 @@ letpair = do
         reservedOp "="
         fmap ((,) i) expr
     reserved "in"
-    fmap (flip (foldr (uncurry Destruct)) ds) expr
+    fmap (flip (foldr (uncurry Unpair)) ds) expr
 
 pair :: Parser Expr
 pair = parens $ do
@@ -140,15 +140,11 @@ annot = parens $ do
     y <- expr
     pure (Ann x y)
 
-toMul :: Int -> Multiplicity
-toMul x = case x of
-    0 -> Zero
-    _ -> Succ (toMul (x-1))
-
-multiplicity :: Parser Multiplicity
+multiplicity :: Parser Affine
 multiplicity =
-    fmap (const Omega) (reserved "w")
-    <|> fmap toMul natLit
+    fmap (const Omega) (reservedOp "!")
+    <|> fmap Affine (reservedOp "^" >> natLit)
+    <|> fmap Linear natLit
 
 usage :: Parser Usage
 usage = angles $ do
@@ -159,34 +155,40 @@ usage = angles $ do
 
 prodtype :: Parser Expr
 prodtype = do
-    (m,x,t) <- angles $ do
-        m <- usage
+    (x,t) <- angles $ do
         x <- name
         reservedOp "::"
         t <- expr
-        pure (m,x,t)
+        pure (x,t)
     reservedOp "->"
     s <- expr
-    pure (Prod (x,m) t s)
+    pure (Prod x t s)
 
 sumtype :: Parser Expr
 sumtype = braces $ do
-    m <- usage
     x <- name
     reservedOp "::"
     t <- expr
     reservedOp ","
     s <- expr
-    pure (Sum (x,m) t s)
+    pure (Sum x t s)
+
+attr :: Parser Expr
+attr = do
+    m <- usage
+    reservedOp "%"
+    b <- exprTerm
+    pure (Attr b m)
 
 exprTerm :: Parser Expr
 exprTerm =
     try lambda
     <|> try pair
     <|> try annot
+    <|> parens expr
+    <|> try attr
     <|> try prodtype
     <|> sumtype
-    <|> parens expr
     <|> variable
     <|> letpair
     <|> fmap (const Type) (reserved "Type")
@@ -202,10 +204,13 @@ appExpr = Infix space AssocLeft
             >> pure App
 
 arrfun :: Expr -> Expr -> Expr
-arrfun t s = Prod (Gen 0,Usage Omega Omega) t s
+arrfun = Prod (Gen 0)
 
 lolipop :: Expr -> Expr -> Expr
-lolipop t s = Prod (Gen 0,Usage Omega rone) t s
+lolipop t = Prod (Gen 0) (Attr t (Usage Omega (Linear 1)))
+
+starpop :: Expr -> Expr -> Expr
+starpop t = Prod (Gen 0) (Attr t (Usage (Linear 1) rzero))
 
 binary :: String -> (a -> a -> a) -> Assoc -> Op a
 binary o f a = flip Infix a $ do
@@ -213,7 +218,7 @@ binary o f a = flip Infix a $ do
     pure f
 
 expr :: Parser Expr
-expr = buildExpressionParser [[appExpr],[binary "->" arrfun AssocRight,binary "-o" lolipop AssocRight]] exprTerm
+expr = buildExpressionParser [[appExpr],[binary "-*" starpop AssocRight,binary "->" arrfun AssocRight,binary "-o" lolipop AssocRight]] exprTerm
 
 parseTL :: String -> String -> Either ParseError Expr
 parseTL = parse expr
