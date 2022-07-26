@@ -1,4 +1,4 @@
-module Parser (parseTL) where
+module Parser (parseTL,TL(..)) where
 
 import Syntax
 
@@ -63,6 +63,12 @@ reserved = Token.reserved lexer
 lexeme :: Parser a -> Parser a
 lexeme = Token.lexeme lexer
 
+comma :: Parser String
+comma = Token.comma lexer
+
+colon :: Parser String
+colon = Token.colon lexer
+
 unlexIdent :: Parser String
 unlexIdent = (do
     c <- Token.identStart bijou
@@ -119,6 +125,7 @@ letpair = do
         reserved "val"
         i <- parens $ do
             x <- name
+            comma
             y <- name
             pure (x,y)
         reservedOp "="
@@ -129,35 +136,48 @@ letpair = do
 pair :: Parser Expr
 pair = parens $ do
     x <- expr
-    reservedOp ","
+    comma
     y <- expr
     pure (Pair x y)
 
 annot :: Parser Expr
 annot = parens $ do
     x <- expr
-    reservedOp "::"
+    colon
     y <- expr
     pure (Ann x y)
 
 multiplicity :: Parser Affine
 multiplicity =
     fmap (const Omega) (reservedOp "!")
-    <|> fmap Affine (reservedOp "^" >> natLit)
-    <|> fmap Linear natLit
+    <|> fmap (const Affine) (reservedOp "?")
+    <|> fmap (const Linear) (reserved "1")
+    <|> fmap (const Zero) (reserved "0")
 
-usage :: Parser Usage
-usage = angles $ do
+explUsage :: Parser Usage
+explUsage = angles $ do
     m <- multiplicity
-    reservedOp ","
+    comma
     n <- multiplicity
     pure (Usage m n)
 
+usage :: Parser Usage
+usage =
+    fmap (const (Usage Omega Linear)) (reservedOp "*")
+    <|> fmap (const (Usage Linear Zero)) (reservedOp "~")
+    <|> fmap (const (Usage Omega Affine)) (reservedOp "?")
+    <|> fmap (const (Usage Omega Omega)) (reservedOp "!")
+    <|> fmap (const (Usage Omega Zero)) (reservedOp "@")
+    <|> explUsage
+
+usageExpr :: Parser Expr
+usageExpr = liftM2 (flip Attr) usage exprTerm
+
 prodtype :: Parser Expr
 prodtype = do
-    (x,t) <- angles $ do
+    (x,t) <- parens $ do
         x <- name
-        reservedOp "::"
+        colon
         t <- expr
         pure (x,t)
     reservedOp "->"
@@ -167,27 +187,20 @@ prodtype = do
 sumtype :: Parser Expr
 sumtype = braces $ do
     x <- name
-    reservedOp "::"
+    colon
     t <- expr
-    reservedOp ","
+    comma
     s <- expr
     pure (Sum x t s)
-
-attr :: Parser Expr
-attr = do
-    m <- usage
-    reservedOp "%"
-    b <- exprTerm
-    pure (Attr b m)
 
 exprTerm :: Parser Expr
 exprTerm =
     try lambda
     <|> try pair
+    <|> try prodtype
     <|> try annot
     <|> parens expr
-    <|> try attr
-    <|> try prodtype
+    <|> try usageExpr
     <|> sumtype
     <|> variable
     <|> letpair
@@ -204,13 +217,13 @@ appExpr = Infix space AssocLeft
             >> pure App
 
 arrfun :: Expr -> Expr -> Expr
-arrfun = Prod (Gen 0)
+arrfun = Prod Hole
 
 lolipop :: Expr -> Expr -> Expr
-lolipop t = Prod (Gen 0) (Attr t (Usage Omega (Linear 1)))
+lolipop t = Prod Hole (Attr t (Usage Omega Linear))
 
 starpop :: Expr -> Expr -> Expr
-starpop t = Prod (Gen 0) (Attr t (Usage (Linear 1) rzero))
+starpop t = Prod Hole (Attr t (Usage Linear rzero))
 
 binary :: String -> (a -> a -> a) -> Assoc -> Op a
 binary o f a = flip Infix a $ do
@@ -220,5 +233,16 @@ binary o f a = flip Infix a $ do
 expr :: Parser Expr
 expr = buildExpressionParser [[appExpr],[binary "-*" starpop AssocRight,binary "->" arrfun AssocRight,binary "-o" lolipop AssocRight]] exprTerm
 
-parseTL :: String -> String -> Either ParseError Expr
-parseTL = parse expr
+data TL
+    = Assert Usage Ident Expr
+    | Define Usage Ident Expr
+    | Eval Usage Expr
+
+tlExpr :: Parser TL
+tlExpr =
+    liftM3 Assert (reserved "assert" >> usage) name (colon >> expr)
+    <|> liftM3 Define (reserved "define" >> usage) name (reservedOp "=" >> expr)
+    <|> liftM2 Eval usage expr
+
+parseTL :: String -> String -> Either ParseError TL
+parseTL = parse tlExpr

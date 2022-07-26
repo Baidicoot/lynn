@@ -10,11 +10,14 @@ import Data.Functor.Foldable
 import Syntax
 
 import Control.Monad
-import Control.Monad.RWS (RWST, runRWST, listen, listens, pass, tell, get, asks, put, local)
+import Control.Monad.RWS (RWST, runRWST, listen, listens, pass, tell, get, ask, asks, put, local)
 import Control.Monad.Except
 
 data TypeError
-    = NotSynthesizable Expr
+    = Debug String TypeError
+    | WhileUnify Expr Expr TypeError
+    | WhileCheck Expr (Type,Usage) TypeError
+    | NotSynthesizable Expr
     | NotSubtype Expr Expr
     | NotSubusage Usage Usage
     | NonFunctionApp Expr
@@ -26,20 +29,16 @@ data TypeError
     deriving(Show)
 
 typeUsage :: Usage
-typeUsage = Usage Omega (Linear 0)
+typeUsage = Usage Omega Zero
 
 unrestricted :: Usage
 unrestricted = Usage Omega Omega
 
 type UsageCtx = (Sign,Sign)
 
-type Checker = RWST (UsageCtx,Usage,Env) UsageEnv Int (Except TypeError)
+newtype Defs = Defs (M.Map Ident Expr)
 
-enterCtx :: UsageCtx -> Checker a -> Checker a
-enterCtx c = local (\(_,u,g)->(c,u,g))
-
-requireN :: Usage -> Checker a -> Checker a
-requireN u = local (\(c,_,g)->(c,u,g))
+type Checker = RWST (Env,Defs) UsageEnv Int (Except TypeError)
 
 destructType :: Type -> Checker (Type,Usage)
 destructType = go <=< toWhnf
@@ -104,6 +103,16 @@ toWhnf e = do
         Just e' -> pure e'
         Nothing -> pure e
 
+inlineDefsHead :: Expr -> Checker (Maybe Expr)
+inlineDefsHead (Var v) = do
+    (_,Defs d) <- ask
+    case M.lookup v d of
+        Just e -> pure (Just e)
+        _ -> pure Nothing
+inlineDefsHead (App f x) = (fmap . fmap) (flip App x) (inlineDefsHead f)
+inlineDefsHead (Unpair v p e) = (fmap . fmap) (flip (Unpair v) e) (inlineDefsHead p)
+inlineDefsHead _ = pure Nothing
+
 subusage :: Usage -> Usage -> Checker ()
 subusage x y =
     if x `rleq` y then
@@ -143,11 +152,18 @@ subtype a b = do
             subtype t e
             subusage unrestricted l
         (x,y) | x == y -> pure ()
-        (x,y) -> throwError (NotSubtype x y)
+        (x,y) -> flip catchError (throwError . WhileUnify x y) $ do
+            x' <- inlineDefsHead x
+            y' <- inlineDefsHead y
+            case (x',y') of
+                (Just x',Just y') -> subtype x' y'
+                (Nothing,Just y') -> subtype x y'
+                (Just x',Nothing) -> subtype x' y
+                (Nothing,Nothing) -> throwError (NotSubtype x y)
 
 withVar :: Ident -> (Type,Usage) -> Checker a -> Checker a
 withVar i (t,l) f = pass $ do
-    (a,m) <- listen (local (\(c,u,Env g)->(c,u,Env (M.insert i (t,l) g))) f)
+    (a,m) <- listen (local (\(Env g,d)->(Env (M.insert i (t,l) g),d)) f)
     let u = case lookupU i m of
             Just u -> u
             Nothing -> rzero
@@ -165,11 +181,11 @@ fresh = do
     put (i+1)
     pure (Gen i)
 
-lookupVar :: Ident -> Checker ((Type,Usage),Usage)
+lookupVar :: Ident -> Checker (Type,Usage)
 lookupVar v = do
-    (c,u,r) <- asks (\(c,u,Env g) -> (c,u,M.lookup v g))
-    case r of
-        Just r -> pure (r,u)
+    t <- asks (\(Env g,d) -> M.lookup v g)
+    case t of
+        Just (t,u) -> pure (t,u)
         Nothing -> throwError (UnknownVar v)
 
 -- `check c e (b,u)` means 'check expression `e` has type `b@u` in usage context `c`'
@@ -185,84 +201,90 @@ Ctx0 + Ctx1 |- s0 (f x) : S@u2
 -}
 
 check :: Expr -> (Type,Usage) -> Checker ()
-check (Abs i e) (Prod j tb sb,u) = do
+check (Abs i e) (Prod j tb sb,r) = do
     (t,u0) <- destructType tb
     (s,u1) <- destructType sb
     let s' = subst (Subst (M.singleton j (Var i))) s
-    (_,u2) <- minFree (withVar i (t,u0) (requireN u1 (check e (s',u1))))
-    subusage u u2
-check (Pair x y) (Sum j tb sb,u) = do
+    (_,u2) <- minFree (withVar i (t,u0) (check e (s',u1)))
+    subusage r u2
+check (Pair x y) (Sum j tb sb,r) = do
     (t,u0) <- destructType tb
-    (s,u1) <- destructType sb
-    (_,u2) <- minFree (requireN u0 (check x (t,u0)))
+    (_,u1) <- minFree (check x (t,u0))
+    subusage u0 u1
     x' <- renameBound x
-    let s' = subst (Subst (M.singleton j x')) s
-    (_,u3) <- minFree (requireN u1 (check y (s',u1)))
-    subusage u u2
-    subusage u u3
-check x (Attr y u,u') = do
+    let sb' = subst (Subst (M.singleton j x')) sb
+    (s,u2) <- destructType sb'
+    (_,u3) <- minFree (check y (s,u2))
+    subusage u2 u3
+    subusage r (meet u0 u2)
+check x (Attr y u,r) = do
     check x (y,u)
-    subusage u' u
-check x (y,u) = do
+    subusage r u
+check x (y,r) = do
     x' <- whnf x
     y' <- whnf y
     case (x',y') of
-        (Just x',Nothing) -> check x' (y,u)
-        (Nothing,Just y') -> check x (y',u)
-        (Just x',Just y') -> check x' (y',u)
+        (Just x',Nothing) -> check x' (y,r)
+        (Nothing,Just y') -> check x (y',r)
+        (Just x',Just y') -> check x' (y',r)
         (Nothing,Nothing) -> do
-            (t,u') <- synthesize x
+            t <- synthesize x r
             subtype y t
-            subusage u u'
 
-synthesize :: Expr -> Checker (Type,Usage)
-synthesize Top = pure (Type,typeUsage)
-synthesize Type = pure (Type,typeUsage)
-synthesize Unit = pure (Top,unrestricted)
-synthesize (Attr t u) = do
+synthesize :: Expr -> Usage -> Checker Type
+synthesize Top r = pure Type
+synthesize Type r = pure Type
+synthesize Unit r = pure Top
+synthesize (Attr t a) r = do
     check t (Type,typeUsage)
-    pure (Type,typeUsage)
-synthesize (Ann e tb) = do
-    enterCtx (szero @Usage :: UsageCtx) (check tb (Type,typeUsage))
+    pure Type
+synthesize (Ann e tb) r = do
+    check tb (Type,rzero)
     (t,u) <- destructType tb
     check e (t,u)
-    pure (t,u)
-synthesize (Prod i tb sb) = enterCtx (szero @Usage :: UsageCtx) $ do
-    check tb (Type,typeUsage)
+    subusage r u
+    pure t
+synthesize (Prod i tb sb) r = do
+    check tb (Type,rzero)
     (t,_) <- destructType tb
-    withVar i (t,unrestricted) (check sb (Type,typeUsage))
-    pure (Type,typeUsage)
-synthesize (Sum i tb sb) = enterCtx (szero @Usage :: UsageCtx) $ do
-    check tb (Type,typeUsage)
+    withVar i (t,unrestricted) (check sb (Type,rzero))
+    pure Type
+synthesize (Sum i tb sb) r = do
+    check tb (Type,rzero)
     (t,_) <- destructType tb
-    withVar i (t,unrestricted) (check sb (Type,typeUsage))
-    pure (Type,Usage Omega rzero)
-synthesize (App f x) = do
-    (t,_) <- synthesize f
-    t' <- toWhnf t
-    case t' of
+    withVar i (t,unrestricted) (check sb (Type,rzero))
+    pure Type
+synthesize (App f x) r = do
+    t <- toWhnf =<< synthesize f r
+    case t of
         Prod i tb sb -> do
             (t,u0) <- destructType tb
             (s,u1) <- destructType sb
-            requireN u0 (check x (t,u0))
+            check x (t,u0)
             x' <- renameBound x
-            pure (subst (Subst (M.singleton i x')) s,u1)
+            pure (subst (Subst (M.singleton i x')) s)
         _ -> throwError (NonFunctionApp f)
-synthesize (Unpair (x,y) p e) = do
-    (t,_) <- synthesize p
-    t' <- toWhnf t
-    case t' of
+synthesize (Unpair (x,y) p e) r = do
+    t <- toWhnf =<< synthesize p r
+    case t of
         Sum i tb sb -> do
             (t,u0) <- destructType tb
             (s,u1) <- destructType sb
             let s' = subst (Subst (M.singleton i (Var x))) s
-            withVar x (t,u0) (withVar y (s',u1) (synthesize e))
+            withVar x (t,u0) (withVar y (s',u1) (synthesize e r))
         _ -> throwError (NonPairDestruct p)
-synthesize (Var v) = do
-    ((t,u),r) <- lookupVar v
-    tell (UsageEnv (M.singleton v u))
-    pure (t,r)
-synthesize x = throwError (NotSynthesizable x)
+synthesize (Var v) r = do
+    (t,u) <- lookupVar v
+    subusage r u
+    tell (UsageEnv (M.singleton v r))
+    pure t
+synthesize x r = throwError (NotSynthesizable x)
 
-typecheck :: Expr -> (UsageCtx,Usage,Env) -> Int -> Either TypeError ((Type,Usage),Int,UsageEnv)
-typecheck e r s = runExcept (runRWST (synthesize e) r s)
+runSynthesize :: Expr -> Usage -> (Env,Defs) -> Int -> Either TypeError (Type,Int,UsageEnv)
+runSynthesize e u r s = runExcept (runRWST (synthesize e u) r s)
+
+runCheck :: Expr -> (Type,Usage) -> (Env,Defs) -> Int -> Either TypeError ((),Int,UsageEnv)
+runCheck e t r s = runExcept (runRWST (check e t) r s)
+
+runWhnf :: Expr -> Usage -> (Env,Defs) -> Int -> Either TypeError ((Expr,Type),Int,UsageEnv)
+runWhnf e u r s = runExcept (runRWST (synthesize e u >>= \t -> fmap (flip (,) t) (toWhnf e)) r s)

@@ -1,0 +1,6 @@
+assert ! addr : Type
+assert ! view : addr -> @Type -> @Type
+assert ! store : (T: @Type) -> T -> {p: addr, *(view p T)}
+assert ! drop : (T: @Type) -> (p: addr) -> *(view p T) -> Top
+assert ! seq : (T: @Type) -> Top -> T -> T
+! let val (p,H) = store Top Unit in seq addr (drop Top p H) p

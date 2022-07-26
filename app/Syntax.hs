@@ -11,6 +11,8 @@ import qualified Data.Map as M
 import Data.Functor.Foldable
 import Data.Functor.Foldable.TH
 
+import Data.Char (isSpace)
+
 {-
 It is probably easier to have a subtyping system,
 where T (unattributed) corresponds to T@<w,w>.
@@ -22,32 +24,51 @@ data Ident
     = Unqualified String
     | Qualified String String
     | Gen Int
-    deriving(Eq,Ord,Show)
+    | Hole
+    deriving(Eq,Ord)
+
+instance Show Ident where
+    show (Unqualified s) = s
+    show (Qualified m s) = m ++ "." ++ s
+    show (Gen i) = "v_" ++ show i
+    show Hole = "_"
 
 data Sign
-    = Zero
-    | Positive
+    = SZero
+    | SPos
     deriving(Eq)
 
 data Affine
-    = Linear Int
-    | Affine Int
+    = Zero
+    | Linear
+    | Affine
     | Omega
-    deriving(Eq,Show)
+    deriving(Eq)
+
+instance Show Affine where
+    show Zero = "0"
+    show Linear = "1"
+    show Affine = "?"
+    show Omega = "!"
 
 data Usage
     = Usage
     { erased :: Affine
     , runtime :: Affine
-    } deriving(Eq,Show)
+    } deriving(Eq)
+
+instance Show Usage where
+    show (Usage Omega Omega) = "!"
+    show (Usage Omega Linear) = "*"
+    show (Usage Linear Zero) = "~"
+    show (Usage Omega Affine) = "?"
+    show (Usage Omega Zero) = "@"
+    show (Usage a b) = "<" ++ show a ++ "," ++ show b ++ ">"
 
 class PartialOrd t where
     pleq :: t -> t -> Bool
     pzero :: t
     meet :: t -> t -> t
-    meet x y | x `pleq` y = x
-    meet x y | y `pleq` x = y
-    meet _ _ = pzero
 
 class (PartialOrd t, Eq s) => Semiring t s | t -> s where
     rzero :: t
@@ -66,44 +87,63 @@ class (PartialOrd t, Eq s) => Semiring t s | t -> s where
 instance PartialOrd Affine where
     -- here a <= b means 'a can be used in place of b' or 'a value of b can be used as an a'
     x `pleq` y | x == y = True
-    Linear 0 `pleq` _ = True
     _ `pleq` Omega = True
-    Affine a `pleq` Affine b = a <= b
-    Linear a `pleq` Affine b = a <= b
+    Linear `pleq` Affine = True
+    Zero `pleq` Affine = True
     _ `pleq` _ = False
 
-    pzero = Linear 0
+    pzero = Zero
+
+    meet Zero x = x
+    meet x Zero = x
+    meet x y | x `pleq` y = x
+    meet y x | y `pleq` x = y
 
 instance Semiring Affine Sign where
-    szero = Zero
+    szero = SZero
     
-    radd (Linear 0) x = x
-    radd x (Linear 0) = x
-    radd (Linear x) (Linear y) = Linear (x + y)
-    radd (Affine x) (Affine y) = Affine (x + y)
-    radd (Linear x) (Affine y) = Affine (x + y)
-    radd (Affine x) (Linear y) = Affine (x + y)
-    radd Omega _ = Omega
-    radd _ Omega = Omega
+    radd Zero x = x
+    radd x Zero  = x
+    radd _ _ = Omega
 
-    rsign (Linear 0) = Zero
-    rsign _ = Positive
+    rsign Zero = SZero
+    rsign _ = SPos
 
-    rmul Zero _ = rzero
-    rmul Positive x = x
+    rmul SZero _ = rzero
+    rmul SPos x = x
 
 instance PartialOrd Usage where
     Usage x y `pleq` Usage v w = x `pleq` v && y `pleq` w
 
     pzero = Usage pzero pzero
 
+    meet (Usage x y) (Usage v w) = Usage (meet x v) (meet y w)
+
 instance Semiring Usage (Sign,Sign) where
-    szero = (Zero,Zero)
+    szero = (SZero,SZero)
 
     radd (Usage x y) (Usage v w) = Usage (radd x v) (radd y w)
 
     rsign (Usage x y) = (rsign x,rsign y)
     rmul (a,b) (Usage x y) = Usage (rmul a x) (rmul b y)
+
+{-
+ideally:
+
+- {T :: <!,0>Type, <!,n>T} should be able to be used <!,n> times.
+- (T :: <!,0>Type) -> <!,n>T -> <!,n>T (where T is free in the body)
+    should be able to be used <!,n> times.
+
+This is important for the admissibility of substitution:
+- (\(T :: <!,0>Type) (x :: !T) -> id T x) has fvs T and x in the body, but
+    should still be able to be used !-many times, as T has runtime usage 0.
+    Otherwise, substituting id leads to a term with a different usage.
+
+And so we have the following subusaging rules:
+- anything can be subusaged as a 0
+- if a given term has free variables a, then the term has usage min{usage(a)},
+    where min{x} is the lowest non-zero usage in x.
+-}
 
 data Expr
     = Attr Expr Usage
@@ -118,9 +158,30 @@ data Expr
     | Unpair (Ident,Ident) Expr Expr
     | App Expr Expr
     | Ann Expr Expr
-    deriving(Show,Eq)
+    deriving(Eq)
 
 makeBaseFunctor ''Expr
+
+toTerm :: String -> String
+toTerm xs | any isSpace xs = "(" ++ xs ++ ")"
+toTerm xs = xs
+
+instance Show Expr where
+    show = cata go
+        where
+            go (AttrF e u) = show u ++ toTerm e
+            go TypeF = "Type"
+            go TopF = "Top"
+            go UnitF = "Unit"
+            go (ProdF Hole t s) = toTerm t ++ " -> " ++ s
+            go (ProdF n t s) = "(" ++ show n ++ " :: " ++ t ++ ") -> " ++ s
+            go (SumF n t s) = "{" ++ show n ++ " :: " ++ t ++ "," ++ s ++ "}"
+            go (VarF n) = show n
+            go (PairF a b) = "(" ++ a ++ "," ++ b ++ ")"
+            go (AbsF n e) = "(\\" ++ show n ++ " -> " ++ e ++ ")"
+            go (UnpairF vs p b) = "let " ++ show vs ++ " = " ++ " in " ++ b
+            go (AppF f x) = f ++ " " ++ toTerm x
+            go (AnnF e t) = "(" ++ e ++ " :: " ++ t ++ ")"
 
 type Type = Expr
 
